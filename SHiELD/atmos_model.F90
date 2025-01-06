@@ -84,9 +84,7 @@ use IPD_driver,         only: IPD_initialize, IPD_setup_step, &
                               IPD_physics_step1,              &
                               IPD_physics_step2, IPD_physics_end
 #ifdef STOCHY
-use stochastic_physics, only: init_stochastic_physics,         &
-                              run_stochastic_physics
-use stochastic_physics_sfc, only: run_stochastic_physics_sfc
+use stochastic_physics_wrapper_mod, only: stochastic_physics_wrapper,stochastic_physics_wrapper_end
 #endif
 use FV3GFS_io_mod,      only: FV3GFS_restart_read, FV3GFS_restart_write, &
                               FV3GFS_IPD_checksum,                       &
@@ -162,14 +160,14 @@ logical :: chksum_debug    = .false.
 logical :: dycore_only     = .false.
 logical :: debug           = .false.
 logical :: sync            = .false.
-logical :: first_time_step = .false.
+logical :: write_first_time_step = .false.
 logical :: fprint          = .true.
 logical :: ignore_rst_cksum = .false. ! enforce (.false.) or override (.true.) data integrity restart checksums
 real, dimension(4096) :: fdiag = 0. ! xic: TODO: this is hard coded, space can run out in some cases. Should make it allocatable.
 logical :: fdiag_override = .false. ! lmh: if true overrides fdiag and fhzer: all quantities are zeroed out
                                     ! after every calcluation, output interval and accumulation/avg/max/min
                                     ! are controlled by diag_manager, fdiag controls output interval only
-namelist /atmos_model_nml/ blocksize, chksum_debug, dycore_only, debug, sync, first_time_step, fdiag, fprint, &
+namelist /atmos_model_nml/ blocksize, chksum_debug, dycore_only, debug, sync, write_first_time_step, fdiag, fprint, &
                            fdiag_override, ignore_rst_cksum
 type (time_type) :: diag_time, diag_time_fhzero
 logical :: fdiag_fix = .false.
@@ -239,6 +237,9 @@ subroutine update_atmos_radiation_physics(Atmos)
     call update_atmos_physics(Atmos)
   end if
 
+  ! Update flag for first time step of time integration
+  IPD_control%first_time_step = .false. 
+
   call mpp_clock_end(shieldClock)
 
 end subroutine update_atmos_radiation_physics
@@ -248,7 +249,7 @@ subroutine update_atmos_pre_radiation (Atmos)
   type (atmos_data_type), intent(in) :: Atmos
 !--- local variables---
     integer :: nb, jdat(8)
-    integer :: nthrds
+    integer :: nthrds, ierr
 
 #ifdef OPENMP
     nthrds = omp_get_max_threads()
@@ -290,10 +291,12 @@ subroutine update_atmos_pre_radiation (Atmos)
       call IPD_setup_step (IPD_Control, IPD_Data, IPD_Diag, IPD_Restart)
 
 #ifdef STOCHY
+      if (IPD_Control%do_sppt .or. IPD_Control%do_shum .or. IPD_Control%do_skeb .or. &
+          IPD_Control%lndp_type > 0  .or. IPD_Control%do_ca .or. IPD_Control%do_spp) then
 !--- call stochastic physics pattern generation / cellular automata
-      if (IPD_Control%do_sppt .OR. IPD_Control%do_shum .OR. IPD_Control%do_skeb .OR. IPD_Control%do_sfcperts) then
-         call run_stochastic_physics(IPD_Control, IPD_Data(:)%Grid, IPD_Data(:)%Coupling, nthrds)
-      end if
+        call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, ierr)
+        if (ierr/=0)  call mpp_error(NOTE, 'Call to stochastic_physics_wrapper failed')
+      endif
 #endif
 
       call mpp_clock_end(setupClock)
@@ -386,6 +389,8 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
 #endif
   use mpp_mod, only: mpp_npes
 
+#include "mpif.h"
+
   type (atmos_data_type), intent(inout) :: Atmos
   type (time_type), intent(in) :: Time_init, Time, Time_step
   integer, intent(in) :: iau_offset
@@ -404,7 +409,6 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
   character(len=64) :: filename, filename2, pelist_name
   character(len=132) :: text
   logical :: p_hydro, hydro, fexist
-  logical :: do_inline_mp, do_cosp
   logical, save :: block_message = .true.
   integer :: bdat(8), cdat(8)
   integer :: ntracers
@@ -467,8 +471,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
 !-----------------------------------------------------------------------
 !--- before going any further check definitions for 'blocks'
 !-----------------------------------------------------------------------
-   call atmosphere_control_data (isc, iec, jsc, jec, nlev, p_hydro, hydro, tile_num, &
-                                 do_inline_mp, do_cosp)
+   call atmosphere_control_data (isc, iec, jsc, jec, nlev, p_hydro, hydro, tile_num)
    call define_blocks_packed ('atmos_model', Atm_block, isc, iec, jsc, jec, nlev, &
                               blocksize, block_message)
 
@@ -495,6 +498,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
 !--- setup IPD Init_parm
    Init_parm%me              =  mpp_pe()
    Init_parm%master          =  mpp_root_pe()
+   Init_parm%fcst_mpi_comm%mpi_val  =  MPI_COMM_WORLD
    Init_parm%tile_num        =  tile_num
    Init_parm%isc             =  isc
    Init_parm%jsc             =  jsc
@@ -519,9 +523,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
    Init_parm%xlat            => Atmos%lat
    Init_parm%area            => Atmos%area
    Init_parm%tracer_names    => tracer_names
-   Init_parm%hydro           = hydro
-   Init_parm%do_inline_mp    = do_inline_mp
-   Init_parm%do_cosp         = do_cosp
+   Init_parm%restart         = Atm(mygrid)%flagstruct%warm_start
 
    allocate(Init_parm%input_nml_file, mold=input_nml_file)
    Init_parm%input_nml_file  => input_nml_file
@@ -529,26 +531,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
 
    call IPD_initialize (IPD_Control, IPD_Data, IPD_Diag, IPD_Restart, Init_parm)
 
-#ifdef STOCHY
-   if (IPD_Control%do_sppt .OR. IPD_Control%do_shum .OR. IPD_Control%do_skeb .OR. IPD_Control%do_sfcperts) then
-      ! Initialize stochastic physics
-      call init_stochastic_physics(IPD_Control, Init_parm, mpp_npes(), nthrds)
-      if (mpp_pe() == mpp_root_pe()) print *,'do_skeb=',IPD_Control%do_skeb
-   end if
-
-   if (IPD_Control%do_sfcperts) then
-      ! Get land surface perturbations here (move to GFS_time_vary
-      ! step if wanting to update each time-step)
-      call run_stochastic_physics_sfc(IPD_Control, IPD_Data(:)%Grid, IPD_Data(:)%Coupling)
-   end if
-#endif
-
-   if (IPD_Control%do_skeb .and. .not. Atm(mygrid)%flagstruct%do_diss_est) then
-      call mpp_error(NOTE, "If using stochy physics (gfs_physics_nml::do_skeb = .T.) ")
-      call mpp_error(NOTE, "   a dissipation estimate must be provided.")
-      call mpp_error(NOTE, "   Setting fv_core_nml::do_diss_est=.T. to enable.")
-      Atm(mygrid)%flagstruct%do_diss_est = .true.
-   endif
+   Atm(mygrid)%flagstruct%do_diss_est = IPD_Control%do_skeb
 
 !  initialize the IAU module
    call iau_initialize (IPD_Control,IAU_data,Init_parm)
@@ -571,8 +554,10 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
 !rab   call atmosphere_tracer_postinit (IPD_Data, Atm_block)
 
    call atmosphere_nggps_diag (Time, init=.true.)
-   call gfdl_diag_register (Time, IPD_Data(:)%Sfcprop, IPD_Data(:)%IntDiag, IPD_Control, IPD_Data(:)%Cldprop, Atm_block, Atmos%axes)
-   call register_diag_manager_controlled_diagnostics(Time, IPD_Data(:)%Sfcprop, IPD_Data(:)%IntDiag, IPD_Control, Atm_block%nblks, Atmos%axes)
+   call gfdl_diag_register (Time, IPD_Data(:)%Sfcprop, IPD_Data(:)%IntDiag, IPD_Data%Cldprop, &
+        Atm_block, Atmos%axes, IPD_Control%nfxr, IPD_Control%ldiag3d, &
+        IPD_Control%nkld, IPD_Control%levs)
+   call register_diag_manager_controlled_diagnostics(Time, IPD_Data(:)%IntDiag, Atm_block%nblks, Atmos%axes)
    if (Atm(mygrid)%coarse_graining%write_coarse_diagnostics) then
        call atmosphere_coarse_diag_axes(coarse_diagnostic_axes)
        call FV3GFS_diag_register_coarse(Time, coarse_diagnostic_axes)
@@ -584,6 +569,15 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
         if (mpp_pe() == mpp_root_pe()) print *,'RESTART READ  ', IPD_Control%kdt, IPD_Control%fhour
         call FV3GFS_IPD_checksum(IPD_Control, IPD_Data, Atm_block)
       endif
+
+#ifdef STOCHY
+   if (IPD_Control%do_sppt .or. IPD_Control%do_shum .or. IPD_Control%do_skeb .or. &
+       IPD_Control%lndp_type > 0  .or. IPD_Control%do_ca .or. IPD_Control%do_spp) then
+!--- Initialize stochastic physics pattern generation / cellular automata for first time step
+     call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, ierr)
+     if (ierr/=0)  call mpp_error(NOTE, 'Call to stochastic_physics_wrapper failed')
+   end if
+#endif
 
    !--- set the initial diagnostic timestamp
    diag_time = Time
@@ -631,6 +625,9 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, iau_offset)
      fv3Clock = mpp_clock_id( '--FV3 Dycore          ', flags=clock_flag_default, grain=CLOCK_COMPONENT )
    endif
    shieldClock= mpp_clock_id( '--SHiELD Physics      ', flags=clock_flag_default, grain=CLOCK_COMPONENT )
+
+   ! Set flag for first time step of time integration
+   IPD_control%first_time_step = .true.
 
 !-----------------------------------------------------------------------
 end subroutine atmos_model_init
@@ -702,14 +699,16 @@ subroutine update_atmos_model_state (Atmos)
     time_int = real(isec)
     ! For overflow safety cast scaled fdiag values to 64-bit nearest integers
     ! before interacting with seconds.
-    if (ANY(nint(fdiag(:)*3600.0, kind=8) == seconds) .or. (fdiag_fix .and. mod(seconds, nint(fdiag(1)*3600.0, kind=8)) .eq. 0) .or. (IPD_Control%kdt == 1 .and. first_time_step) ) then
+    if (ANY(nint(fdiag(:)*3600.0, kind=8) == seconds) .or. (fdiag_fix .and. mod(seconds, nint(fdiag(1)*3600.0, kind=8)) .eq. 0) .or. (IPD_Control%kdt == 1 .and. write_first_time_step) ) then
       if (mpp_pe() == mpp_root_pe()) write(6,*) "---isec,seconds",isec,seconds
       if (mpp_pe() == mpp_root_pe()) write(6,*) ' gfs diags time since last bucket empty: ',time_int/3600.,'hrs'
       call atmosphere_nggps_diag(Atmos%Time)
     endif
     ! For overflow safety cast scaled fdiag values to 64-bit nearest integers
     ! before interacting with seconds.
-    if (ANY(nint(fdiag(:)*3600.0, kind=8) == seconds) .or. (fdiag_fix .and. mod(seconds, nint(fdiag(1)*3600.0, kind=8)) .eq. 0) .or. (IPD_Control%kdt == 1 .and. first_time_step)) then
+    ! if (ANY(nint(fdiag(:)*3600.0, kind=8) == seconds) .or. (fdiag_fix .and. mod(seconds, nint(fdiag(1)*3600.0, kind=8)) .eq. 0) .or. (IPD_Control%kdt == 1 .and. write_first_time_step)) then
+    ! remove IPD_Control%kdt == 1 condition to be able to output first time step fields for cold start forecast  
+    if (ANY(nint(fdiag(:)*3600.0, kind=8) == seconds) .or. (fdiag_fix .and. mod(seconds, nint(fdiag(1)*3600.0, kind=8)) .eq. 0) .or. write_first_time_step) then
       if(Atmos%iau_offset > zero) then
         if( time_int - Atmos%iau_offset*3600. > zero ) then
           time_int = time_int - Atmos%iau_offset*3600.
@@ -808,6 +807,14 @@ subroutine atmos_model_end (Atmos)
 !---- termination routine for atmospheric model ----
 
     call atmosphere_end (Atmos % Time, Atmos%grid)
+
+#ifdef STOCHY
+    if (IPD_Control%do_sppt .or. IPD_Control%do_shum .or. IPD_Control%do_skeb .or. &
+        IPD_Control%lndp_type > 0  .or. IPD_Control%do_ca .or. IPD_Control%do_spp) then
+      call stochastic_physics_wrapper_end(IPD_control)
+    endif 
+#endif
+
     if (.not. dycore_only) then
        call FV3GFS_restart_write (IPD_Data, IPD_Restart, Atm_block, &
             IPD_Control, Atmos%domain)
