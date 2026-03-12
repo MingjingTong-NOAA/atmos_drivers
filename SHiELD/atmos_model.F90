@@ -294,9 +294,10 @@ logical :: do_netcdf_restart = .true.
 logical :: restart_tbot_qbot = .false.
 integer :: nxblocks = 1
 integer :: nyblocks = 1
+integer :: iau_offset = 0
 namelist /atmos_model_nml/ do_netcdf_restart, restart_tbot_qbot, nxblocks, nyblocks, &
                            blocksize, chksum_debug, dycore_only, debug, sync, write_first_time_step, fdiag, fprint, &
-                           fdiag_override, ignore_rst_cksum, fullcoupler_fluxes
+                           fdiag_override, ignore_rst_cksum, fullcoupler_fluxes, iau_offset
 
 type (time_type) :: diag_time, diag_time_fhzero
 logical :: fdiag_fix = .false.
@@ -761,7 +762,6 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, do_concurrent_ra
   type (time_type), intent(in) :: Time_init, Time, Time_step
   logical, intent(in) :: do_concurrent_radiation
 !--- local variables ---
-  integer :: iau_offset = 0
   integer :: unit, ntdiag, ntfamily, i, j, k
   integer :: mlon, mlat, nlon, nlat, nlev, sec, dt, sec_prev
   integer :: ierr, io, logunit
@@ -807,6 +807,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, do_concurrent_ra
    IF ( file_exists('input.nml')) THEN
       read(input_nml_file, nml=atmos_model_nml, iostat=io)
       ierr = fms_check_nml_error(io, 'atmos_model_nml')
+      Atmos%iau_offset = iau_offset
    endif
 !-----------------------------------------------------------------------
    call get_number_tracers(MODEL_ATMOS, num_tracers=ntracers)
