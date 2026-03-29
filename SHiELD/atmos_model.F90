@@ -643,7 +643,7 @@ subroutine update_atmos_model_radiation (Surface_boundary, Atmos) ! name change 
 !--- call stochastic physics pattern generation / cellular automata
       if (IPD_Control%do_sppt .or. IPD_Control%do_shum .or. IPD_Control%do_skeb .or. &
           IPD_Control%lndp_type > 0  .or. IPD_Control%do_ca .or. IPD_Control%do_spp) then
-        call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, ierr)
+        call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, nthrds, ierr)
         if (ierr/=0)  call mpp_error(FATAL, 'Call to stochastic_physics_wrapper failed')
       endif
 #endif
@@ -756,8 +756,6 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, do_concurrent_ra
 #endif
   use mpp_mod, only: mpp_npes
 
-#include "mpif.h"
-
   type (atmos_data_type), intent(inout) :: Atmos
   type (time_type), intent(in) :: Time_init, Time, Time_step
   logical, intent(in) :: do_concurrent_radiation
@@ -859,7 +857,6 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, do_concurrent_ra
 !--- setup IPD Init_parm
    Init_parm%me              =  mpp_pe()
    Init_parm%master          =  mpp_root_pe()
-   Init_parm%fcst_mpi_comm%mpi_val  =  MPI_COMM_WORLD
    Init_parm%tile_num        =  tile_num
    Init_parm%isc             =  isc
    Init_parm%jsc             =  jsc
@@ -941,7 +938,7 @@ subroutine atmos_model_init (Atmos, Time_init, Time, Time_step, do_concurrent_ra
    if (IPD_Control%do_sppt .or. IPD_Control%do_shum .or. IPD_Control%do_skeb .or. &
        IPD_Control%lndp_type > 0  .or. IPD_Control%do_ca .or. IPD_Control%do_spp) then
 !--- Initialize stochastic physics pattern generation / cellular automata for first time step
-     call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, ierr)
+     call stochastic_physics_wrapper(IPD_control, IPD_data, Atm_block, nthrds, ierr)
      if (ierr/=0)  call mpp_error(FATAL, 'Call to stochastic_physics_wrapper failed')
    end if
 #endif
